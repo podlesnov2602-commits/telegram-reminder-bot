@@ -1,67 +1,99 @@
 import os
-import telebot
-from flask import Flask, request
+import logging
 from datetime import datetime, timedelta
-import threading
-import time
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.environ.get("TOKEN", "8390901633:AAGWzRUhrm2qst2IDyk9tDwJvJvq2Lxv6Nw")
-bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
+# Логирование
+logging.basicConfig(level=logging.INFO)
 
-reminders = []
+# Токен из переменной окружения
+TOKEN = os.getenv("BOT_TOKEN")
 
-def reminder_checker():
-    while True:
-        now = datetime.now()
-        for r in reminders[:]:
-            if now >= r["time"]:
-                bot.send_message(r["chat_id"], f"? �����������: {r['text']}")
-                reminders.remove(r)
-        time.sleep(30)
+# Планировщик
+scheduler = BackgroundScheduler()
+scheduler.start()
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "������! ������� ������� � �������:\n/remind HH:MM �����")
+# Функция отправки напоминания
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    chat_id, text = context.job.context
+    await context.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание: {text}")
 
-@bot.message_handler(commands=['remind'])
-def remind(message):
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Напиши в формате:\n/напомни HH:MM текст"
+    )
+
+# Команда /напомни
+async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        parts = message.text.split(" ", 2)
-        time_str = parts[1]
-        text = parts[2]
-        hour, minute = map(int, time_str.split(":"))
+        time_str = context.args[0]
+        text = " ".join(context.args[1:])
+
+        # Преобразуем время
+        remind_time = datetime.strptime(time_str, "%H:%M").time()
         now = datetime.now()
-        remind_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if remind_time < now:
-            remind_time += timedelta(days=1)
-        reminders.append({"time": remind_time, "text": text, "chat_id": message.chat.id})
-        bot.reply_to(message, f"? ����������� ����������� �� {remind_time.strftime('%H:%M')}")
-    except:
-        bot.reply_to(message, "? ������: /remind HH:MM �����")
+        target = datetime.combine(now.date(), remind_time)
 
-@bot.message_handler(commands=['list'])
-def list_reminders(message):
-    if reminders:
-        reply = "?? ������ �����������:\n" + "\n".join(
-            [f"{r['time'].strftime('%H:%M')} � {r['text']}" for r in reminders if r["chat_id"] == message.chat.id]
+        if target < now:
+            target += timedelta(days=1)
+
+        # Добавляем задачу
+        scheduler.add_job(
+            send_reminder,
+            "date",
+            run_date=target,
+            args=[context],
+            kwargs={},
+            id=f"{update.effective_chat.id}_{time_str}",
+            replace_existing=True
         )
-    else:
-        reply = "?? � ���� ��� �����������."
-    bot.reply_to(message, reply)
+        scheduler.add_job(
+            send_reminder,
+            "date",
+            run_date=target,
+            args=[context],
+            kwargs={},
+            id=f"{update.effective_chat.id}_{time_str}",
+            replace_existing=True
+        )
+        scheduler.add_job(
+            send_reminder,
+            "date",
+            run_date=target,
+            args=[],
+            kwargs={},
+            id=None,
+            replace_existing=False
+        )
 
-@app.route("/" + TOKEN, methods=["POST"])
-def webhook():
-    json_str = request.get_data().decode("UTF-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "OK", 200
+        # Передаём chat_id и текст как контекст
+        scheduler.add_job(
+            send_reminder,
+            "date",
+            run_date=target,
+            args=[],
+            kwargs={},
+            id=None,
+            replace_existing=False,
+            jobstore=None,
+            misfire_grace_time=None,
+            coalesce=True,
+            context=(update.effective_chat.id, text)
+        )
 
-@app.route("/")
-def index():
-    return "��� ��������!"
+        await update.message.reply_text(f"Напоминание установлено на {time_str}: {text}")
+
+    except Exception as e:
+        logging.error(e)
+        await update.message.reply_text("Ошибка! Формат: /напомни HH:MM текст")
+
+# Создаём приложение
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("напомни", remind))
 
 if __name__ == "__main__":
-    threading.Thread(target=reminder_checker, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run_polling()
