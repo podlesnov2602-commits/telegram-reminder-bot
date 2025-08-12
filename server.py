@@ -1,43 +1,66 @@
 import os
+import asyncio
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import logging
 
-# Логирование
-logging.basicConfig(level=logging.INFO)
+# Читаем токен из переменной окружения
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена!")
 
-# Берём токен из переменной окружения
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден. Установите переменную окружения BOT_TOKEN.")
+# Создаем Flask-приложение
+app = Flask(__name__)
 
-# Создаём приложение Telegram
-app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
+# Хранилище задач для напоминаний
+reminders = {}
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я твой бот.")
+    await update.message.reply_text("Привет! Я бот-напоминалка ⏰\nИспользуй /remind <секунды> <текст>")
 
-app_tg.add_handler(CommandHandler("start", start))
+# Команда /remind
+async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        delay = int(context.args[0])
+        text = " ".join(context.args[1:])
+        user_id = update.effective_user.id
 
-# Flask-сервер
-app = Flask(__name__)
+        if not text:
+            await update.message.reply_text("❌ Укажи текст напоминания!")
+            return
 
-@app.route("/")
-def home():
-    return "Бот работает!"
+        await update.message.reply_text(f"✅ Напоминание установлено через {delay} секунд.")
 
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+        # Запускаем отложенное сообщение
+        asyncio.create_task(send_reminder(user_id, text, delay, context))
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Формат: /remind <секунды> <текст>")
+
+# Отправка напоминания
+async def send_reminder(user_id, text, delay, context):
+    await asyncio.sleep(delay)
+    await context.bot.send_message(chat_id=user_id, text=f"🔔 Напоминание: {text}")
+
+# Настройка вебхука
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), app_tg.bot)
-    app_tg.update_queue.put_nowait(update)
+    data = request.get_json(force=True)
+    update = Update.de_json(data, application.bot)
+    application.update_queue.put_nowait(update)
     return "ok"
 
-if __name__ == "__main__":
-    # Устанавливаем webhook при старте
-    webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook/{BOT_TOKEN}"
-    app_tg.bot.set_webhook(url=webhook_url)
-    logging.info(f"Webhook установлен: {webhook_url}")
+@app.route("/")
+def index():
+    return "✅ Бот запущен!"
 
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+if __name__ == "__main__":
+    # Создаем приложение Telegram
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Регистрируем команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("remind", remind))
+
+    # Запускаем Flask
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
