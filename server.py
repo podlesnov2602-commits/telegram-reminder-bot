@@ -1,68 +1,58 @@
 import os
-import logging
-from datetime import datetime, timedelta
+from flask import Flask, request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
-# Логирование
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+TOKEN = os.getenv("BOT_TOKEN", "8390901633:AAGWzRUhrm2qst2IDyk9tDwJvJvq2Lxv6Nw")
+URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook"
 
-# Читаем токен из переменной окружения
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("BOT_TOKEN не найден. Добавьте его в Environment Variables на Render.")
-
-# Создаем приложение Telegram
-app = Application.builder().token(TOKEN).build()
-
-# Планировщик
-scheduler = AsyncIOScheduler()
+app = Flask(__name__)
+scheduler = BackgroundScheduler()
 scheduler.start()
 
+# Создаём Telegram-приложение
+application = Application.builder().token(TOKEN).build()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я бот-напоминалка.\n"
-        "Напиши команду /remind <минуты> <текст>, и я напомню.\n"
-        "Например: /remind 1 покормить кота"
-    )
+    await update.message.reply_text("Привет! Напиши: 'Напомни через 10 минут выпить воду' или 'Напомни завтра в 10:00 оплатить интернет'.")
 
-async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        minutes = int(context.args[0])
-        text = " ".join(context.args[1:])
-        if not text:
-            await update.message.reply_text("Пожалуйста, укажите текст напоминания.")
-            return
 
-        remind_time = datetime.now() + timedelta(minutes=minutes)
+async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+    if "через" in text and "минут" in text:
+        try:
+            minutes = int(text.split("через")[1].split("минут")[0].strip())
+            time = datetime.now() + timedelta(minutes=minutes)
+            scheduler.add_job(lambda: application.bot.send_message(update.effective_chat.id, f"Напоминаю: {text}"), 'date', run_date=time)
+            await update.message.reply_text(f"Напоминание через {minutes} минут установлено!")
+        except:
+            await update.message.reply_text("Не понял время. Пример: 'Напомни через 5 минут выпить чай'.")
+    else:
+        await update.message.reply_text("Формат пока поддерживает только 'через X минут'.")
 
-        scheduler.add_job(
-            send_reminder,
-            "date",
-            run_date=remind_time,
-            args=[update.effective_chat.id, text],
-        )
 
-        await update.message.reply_text(
-            f"Напоминание через {minutes} мин.: {text}"
-        )
-    except (IndexError, ValueError):
-        await update.message.reply_text("Формат: /remind <минуты> <текст>")
+# Регистрируем команды и обработчики
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder))
 
-async def send_reminder(chat_id: int, text: str):
-    try:
-        await app.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {text}")
-    except Exception as e:
-        logger.error(f"Ошибка при отправке напоминания: {e}")
 
-# Регистрируем команды
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("remind", remind))
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put_nowait(update)
+    return "ok", 200
 
-if __name__ == "__main__":
-    logger.info("Бот запущен")
-    app.run_polling()
+
+@app.route('/')
+async def set_webhook():
+    await application.bot.set_webhook(URL)
+    return "Webhook set", 200
+
+
+if __name__ == '__main__':
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(application.bot.set_webhook(URL))
+    app.run(host="0.0.0.0", port=5000)
