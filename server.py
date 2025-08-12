@@ -10,7 +10,7 @@ logging.basicConfig(
 )
 
 # 🔑 Токен бота (ОСТОРОЖНО: хранить в коде небезопасно)
-TOKEN = "8390901633:AAGWzRUhrm2qst2IDyk9tDwJvJvq2Lxv6Nw"
+TOKEN = os.getenv("BOT_TOKEN")
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -74,3 +74,4 @@ if __name__ == "__main__":
 
     logging.info("Бот запущен")
     app.run_polling()
+
