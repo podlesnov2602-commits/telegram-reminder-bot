@@ -1,99 +1,76 @@
-import os
 import logging
-from datetime import datetime, timedelta
-from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
 # Логирование
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 
-# Токен из переменной окружения
-TOKEN = os.getenv("BOT_TOKEN")
+# 🔑 Токен бота (ОСТОРОЖНО: хранить в коде небезопасно)
+TOKEN = "8390901633:AAGWzRUhrm2qst2IDyk9tDwJvJvq2Lxv6Nw"
 
-# Планировщик
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# Функция отправки напоминания
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    chat_id, text = context.job.context
-    await context.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание: {text}")
+# Словарь для хранения напоминаний
+reminders = {}
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Напиши в формате:\n/напомни HH:MM текст"
+        "Привет! Я бот-напоминалка.\n"
+        "Напиши /napomni HH:MM текст, чтобы я напомнил.\n"
+        "Например: /napomni 14:30 Позвонить маме."
     )
 
-# Команда /напомни
+# Обработчик команды /napomni
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         time_str = context.args[0]
-        text = " ".join(context.args[1:])
+        reminder_text = " ".join(context.args[1:])
 
-        # Преобразуем время
-        remind_time = datetime.strptime(time_str, "%H:%M").time()
+        if not reminder_text:
+            await update.message.reply_text("❌ Укажи текст напоминания после времени.")
+            return
+
+        # Парсим время
+        reminder_time = datetime.strptime(time_str, "%H:%M").time()
         now = datetime.now()
-        target = datetime.combine(now.date(), remind_time)
+        reminder_datetime = datetime.combine(now.date(), reminder_time)
 
-        if target < now:
-            target += timedelta(days=1)
+        if reminder_datetime < now:
+            reminder_datetime += timedelta(days=1)
 
-        # Добавляем задачу
+        chat_id = update.effective_chat.id
+        reminders[chat_id] = (reminder_datetime, reminder_text)
+
+        # Запускаем задачу
         scheduler.add_job(
             send_reminder,
             "date",
-            run_date=target,
-            args=[context],
-            kwargs={},
-            id=f"{update.effective_chat.id}_{time_str}",
-            replace_existing=True
-        )
-        scheduler.add_job(
-            send_reminder,
-            "date",
-            run_date=target,
-            args=[context],
-            kwargs={},
-            id=f"{update.effective_chat.id}_{time_str}",
-            replace_existing=True
-        )
-        scheduler.add_job(
-            send_reminder,
-            "date",
-            run_date=target,
-            args=[],
-            kwargs={},
-            id=None,
-            replace_existing=False
+            run_date=reminder_datetime,
+            args=[context, chat_id, reminder_text]
         )
 
-        # Передаём chat_id и текст как контекст
-        scheduler.add_job(
-            send_reminder,
-            "date",
-            run_date=target,
-            args=[],
-            kwargs={},
-            id=None,
-            replace_existing=False,
-            jobstore=None,
-            misfire_grace_time=None,
-            coalesce=True,
-            context=(update.effective_chat.id, text)
+        await update.message.reply_text(
+            f"✅ Напоминание установлено на {reminder_datetime.strftime('%H:%M')}."
         )
 
-        await update.message.reply_text(f"Напоминание установлено на {time_str}: {text}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Формат: /napomni HH:MM текст")
 
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text("Ошибка! Формат: /напомни HH:MM текст")
-
-# Создаём приложение
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("напомни", remind))
+# Функция отправки напоминания
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id, text):
+    await context.bot.send_message(chat_id, f"⏰ Напоминание: {text}")
 
 if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("napomni", remind))  # Латиница в названии команды
+
+    logging.info("Бот запущен")
     app.run_polling()
