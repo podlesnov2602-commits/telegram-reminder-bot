@@ -1,25 +1,31 @@
 import os
 import json
+import logging
+from datetime import datetime, timedelta
+from flask import Flask, request
+import requests
 import threading
 import time
-from datetime import datetime, timedelta
-import requests
-from flask import Flask, request
 
-# ===== НАСТРОЙКИ =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Берёт токен из переменной окружения на Render
-USER_IDS = [370958352, 7148028443]  # ID получателей
-TIMEZONE_OFFSET = 5  # GMT+5
+# === НАСТРОЙКИ ===
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8390901633:AAGWzRUhrm2qst2IDyk9tDwJvJvq2Lxv6Nw")
+BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+CHAT_IDS = [370958352, 7148028443]  # кому будут приходить уведомления
+TIMEZONE_OFFSET = 5  # разница в часах (GMT+5)
 
 REMINDERS_FILE = "reminders.json"
-CHECK_INTERVAL = 30  # секунд
 
-app = Flask(__name__)
+# === ЛОГИ ===
+logging.basicConfig(level=logging.INFO)
 
-# ===== ФУНКЦИИ =====
+# === СОЗДАНИЕ ФАЙЛА ЕСЛИ ЕГО НЕТ ===
+if not os.path.exists(REMINDERS_FILE):
+    with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f, ensure_ascii=False, indent=2)
+    logging.info(f"Файл {REMINDERS_FILE} создан.")
+
+# === ФУНКЦИИ ===
 def load_reminders():
-    if not os.path.exists(REMINDERS_FILE):
-        return []
     with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -27,49 +33,67 @@ def save_reminders(reminders):
     with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
         json.dump(reminders, f, ensure_ascii=False, indent=2)
 
-def send_message(user_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": user_id, "text": text})
+def add_reminder(text, remind_time):
+    reminders = load_reminders()
+    reminders.append({"text": text, "time": remind_time})
+    save_reminders(reminders)
+    logging.info(f"Добавлено напоминание: {text} на {remind_time}")
+
+def send_message(chat_id, text):
+    requests.post(BOT_URL, json={"chat_id": chat_id, "text": text})
 
 def check_reminders():
     while True:
-        reminders = load_reminders()
         now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
-        updated = []
+        now_str = now.strftime("%Y-%m-%d %H:%M")
+        reminders = load_reminders()
+        new_list = []
         for r in reminders:
-            remind_time = datetime.strptime(r["time"], "%Y-%m-%d %H:%M")
-            if now >= remind_time:
-                for uid in USER_IDS:
-                    send_message(uid, f"🔔 Напоминание: {r['text']}")
+            if r["time"] == now_str:
+                for chat_id in CHAT_IDS:
+                    send_message(chat_id, f"🔔 Напоминание: {r['text']}")
+                logging.info(f"Отправлено напоминание: {r['text']}")
             else:
-                updated.append(r)
-        if len(updated) != len(reminders):
-            save_reminders(updated)
-        time.sleep(CHECK_INTERVAL)
+                new_list.append(r)
+        save_reminders(new_list)
+        time.sleep(60)  # проверяем каждую минуту
 
-# ===== ТЕСТОВЫЕ НАПОМИНАНИЯ =====
-def create_test_reminders():
-    now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
-    test_data = [
-        {"time": (now + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M"), "text": "Тестовое напоминание через 5 минут"},
-        {"time": (now + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M"), "text": "Тестовое напоминание через 10 минут"}
-    ]
-    save_reminders(test_data)
+# === ЗАПУСК ФОНА ===
+threading.Thread(target=check_reminders, daemon=True).start()
 
-# ===== ОБРАБОТЧИКИ =====
+# === FLASK ПРИЛОЖЕНИЕ ===
+app = Flask(__name__)
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
-        data = request.json
+        data = request.get_json()
+        logging.info(f"Получено: {data}")
         if "message" in data:
             chat_id = data["message"]["chat"]["id"]
-            text = data["message"].get("text", "").strip()
-            if text.lower() == "/start":
-                send_message(chat_id, "✅ Бот работает. Напоминания будут приходить автоматически.")
+            text = data["message"].get("text", "")
+
+            if text.startswith("/add"):
+                try:
+                    _, date_str, time_str, *reminder_text = text.split()
+                    reminder_text = " ".join(reminder_text)
+                    remind_time = f"{date_str} {time_str}"
+                    add_reminder(reminder_text, remind_time)
+                    send_message(chat_id, f"✅ Напоминание добавлено на {remind_time}")
+                except Exception as e:
+                    send_message(chat_id, "❌ Формат: /add YYYY-MM-DD HH:MM текст")
+            elif text.startswith("/list"):
+                reminders = load_reminders()
+                if reminders:
+                    msg = "\n".join([f"{r['time']} — {r['text']}" for r in reminders])
+                else:
+                    msg = "Нет активных напоминаний."
+                send_message(chat_id, msg)
+            else:
+                send_message(chat_id, "Привет! Я работаю.\n"
+                                       "Добавить: /add YYYY-MM-DD HH:MM текст\n"
+                                       "Список: /list")
     return "OK"
 
-# ===== ЗАПУСК =====
 if __name__ == "__main__":
-    if not os.path.exists(REMINDERS_FILE):
-        create_test_reminders()
-    threading.Thread(target=check_remin_
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
