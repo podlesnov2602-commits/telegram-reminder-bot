@@ -1,249 +1,243 @@
 import os
 import json
-import time
-import sqlite3
 import threading
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+import time
+import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 
-# -------------------- Конфигурация --------------------
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]  # обязателен
-API_SECRET = os.getenv("API_SECRET", "supersecret")     # секрет для внешнего API (для меня)
-DEFAULT_TZ = os.getenv("DEFAULT_TZ", "+05:00")          # твой пояс по умолчанию (GMT+5)
+# -------------------- Конфиг --------------------
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+WEBHOOK_BASE = os.environ["WEBHOOK_URL"].rstrip("/")
 
-# Попробуем собрать URL вебхука автоматически, если WEBHOOK_URL не задан
-BASE_URL = os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or (BASE_URL.rstrip("/") + "/webhook" if BASE_URL else None)
-if not WEBHOOK_URL:
-    raise ValueError("WEBHOOK_URL/WEBHOOK_BASE_URL/RENDER_EXTERNAL_URL не заданы и их нельзя вывести автоматически.")
+API_SECRET = os.environ.get("API_SECRET", "Test12345!")
 
-ADMIN_IDS = []
-raw_admins = os.getenv("ADMIN_IDS", "")
-if raw_admins.strip():
-    for part in raw_admins.replace(" ", "").split(","):
-        if part:
-            ADMIN_IDS.append(int(part))
+# Получатели по умолчанию — твои ID
+DEFAULT_CHAT_IDS = "370958352,7148028443"
+CHAT_IDS = [
+    int(x.strip())
+    for x in os.environ.get("CHAT_IDS", DEFAULT_CHAT_IDS).split(",")
+    if x.strip()
+]
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+TIMEZONE = os.environ.get("TIMEZONE", "Asia/Tashkent")  # UTC+5 по умолчанию
+TZ = ZoneInfo(TIMEZONE)
 
-DB_PATH = "reminders.db"
+REM_FILE = "reminders.json"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("reminder-bot")
+# Интервалы
+CHECK_INTERVAL_SEC = 30          # как часто проверяем напоминания
+SEND_WINDOW_SEC = 59             # окно рассылки (на случай редкого тика)
+# ------------------------------------------------
 
 app = Flask(__name__)
 
-# -------------------- Утилиты времени --------------------
-def parse_tz_offset(tz_str: str) -> timezone:
-    """
-    tz_str вида '+05:00' или '-03:30'
-    """
-    if not tz_str or len(tz_str) < 3:
-        tz_str = DEFAULT_TZ
-    sign = 1 if tz_str.startswith("+") else -1
-    hh, mm = tz_str[1:].split(":")
-    return timezone(sign * timedelta(hours=int(hh), minutes=int(mm)))
 
-def local_to_utc(dt_local_str: str, tz_str: Optional[str]) -> datetime:
-    """
-    dt_local_str: 'YYYY-MM-DD HH:MM' в локальном поясе tz_str (или DEFAULT_TZ)
-    возвращает UTC-aware datetime
-    """
-    tz = parse_tz_offset(tz_str or DEFAULT_TZ)
-    naive = datetime.strptime(dt_local_str.strip(), "%Y-%m-%d %H:%M")
-    aware = naive.replace(tzinfo=tz)
-    return aware.astimezone(timezone.utc)
+# ----------- Утилиты хранения -----------
+def _ensure_file():
+    if not os.path.exists(REM_FILE):
+        with open(REM_FILE, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def _load_all():
+    _ensure_file()
+    with open(REM_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# -------------------- База данных --------------------
-def db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _save_all(items):
+    tmp = REM_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, REM_FILE)
 
-def init_db():
-    with db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                send_at_utc TEXT NOT NULL,
-                created_at_utc TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_due ON reminders(send_at_utc)")
-    log.info("✅ DB инициализирована")
+def _now_local():
+    return datetime.now(TZ)
 
-# -------------------- Телеграм --------------------
-def tg_send_message(chat_id: int, text: str) -> bool:
+def _parse_local_dt(s: str) -> datetime:
+    # Ожидаем формат "YYYY-MM-DD HH:MM" в ЛОКАЛЬНОМ времени (TIMEZONE)
+    return datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(TZ).isoformat(timespec="minutes")
+
+# ----------- Отправка в Telegram -----------
+def send_message(chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": text}
     try:
-        r = requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
-        if r.status_code == 429:
-            retry = r.json().get("parameters", {}).get("retry_after", 1)
-            time.sleep(retry)
-            r = requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
-        ok = r.ok and r.json().get("ok", False)
-        if not ok:
-            log.warning(f"✖️ Не удалось отправить {chat_id}: {r.text}")
-        return ok
-    except Exception as e:
-        log.exception(f"Ошибка отправки {chat_id}: {e}")
-        return False
-
-def set_webhook():
-    r = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL, "allowed_updates": ["message"]})
-    try:
-        log.info(f"📡 Результат установки вебхука: {r.json()}")
+        requests.post(url, json=data, timeout=10)
     except Exception:
-        log.info(f"📡 setWebhook HTTP {r.status_code}")
+        pass  # не падаем из-за сетевых сбоев
 
-# -------------------- Планировщик --------------------
-STOP_FLAG = False
+def broadcast(text: str, chat_ids=None):
+    ids = chat_ids if chat_ids else CHAT_IDS
+    for cid in ids:
+        send_message(cid, text)
 
+# ----------- Планировщик -----------
 def scheduler_loop():
-    log.info("⏰ Планировщик запущен")
-    while not STOP_FLAG:
+    # При первом старте — создадим два тестовых, если файл пуст
+    items = _load_all()
+    if not items:
+        t1 = _now_local() + timedelta(minutes=2)
+        t2 = _now_local() + timedelta(minutes=5)
+        items.extend([
+            {
+                "id": uuid.uuid4().hex,
+                "text": "Тест №1: напоминание через ~2 минуты",
+                "run_at": _iso(t1),
+                "sent": False,
+                "chat_ids": CHAT_IDS,
+                "created_by": "auto"
+            },
+            {
+                "id": uuid.uuid4().hex,
+                "text": "Тест №2: напоминание через ~5 минут",
+                "run_at": _iso(t2),
+                "sent": False,
+                "chat_ids": CHAT_IDS,
+                "created_by": "auto"
+            },
+        ])
+        _save_all(items)
+
+    while True:
         try:
-            # Берём все просроченные или текущие напоминания (с небольшим буфером)
-            due_ts = now_utc().isoformat()
-            with db() as conn:
-                rows = conn.execute(
-                    "SELECT * FROM reminders WHERE send_at_utc <= ? ORDER BY id LIMIT 50",
-                    (due_ts,)
-                ).fetchall()
+            now = _now_local()
+            items = _load_all()
+            modified = False
 
-            for row in rows:
-                rid = row["id"]
-                chat_id = row["chat_id"]
-                text = row["text"]
-                ok = tg_send_message(chat_id, text)
-                with db() as conn:
-                    if ok:
-                        conn.execute("DELETE FROM reminders WHERE id = ?", (rid,))
-                    else:
-                        # на случай сбоя: попробуем ещё через минуту, максимум 5 попыток
-                        if row["attempts"] >= 5:
-                            conn.execute("DELETE FROM reminders WHERE id = ?", (rid,))
-                        else:
-                            new_time = (datetime.fromisoformat(row["send_at_utc"]).replace(tzinfo=timezone.utc)
-                                        + timedelta(minutes=1)).isoformat()
-                            conn.execute(
-                                "UPDATE reminders SET attempts = attempts + 1, send_at_utc = ? WHERE id = ?",
-                                (new_time, rid)
-                            )
-        except Exception as e:
-            log.exception(f"Сбой планировщика: {e}")
+            for it in items:
+                if it.get("sent"):
+                    continue
+                run_at = datetime.fromisoformat(it["run_at"])
+                # Шлём, когда настало время (с окном)
+                if run_at <= now and (now - run_at).total_seconds() <= SEND_WINDOW_SEC:
+                    text = it["text"]
+                    cids = it.get("chat_ids") or CHAT_IDS
+                    broadcast(f"🔔 Напоминание:\n{text}", chat_ids=cids)
+                    it["sent"] = True
+                    modified = True
 
-        time.sleep(20)  # проверяем каждые 20 сек
+            if modified:
+                _save_all(items)
+        except Exception:
+            # Никогда не умираем
+            pass
 
-# -------------------- Вспомогательное --------------------
-def require_secret(req):
-    sec = req.headers.get("X-Api-Secret") or req.args.get("secret")
-    if sec != API_SECRET:
-        abort(401, "Unauthorized")
+        time.sleep(CHECK_INTERVAL_SEC)
 
-def add_many_reminders(chat_ids: List[int], text: str, dt_local: str, tz_str: Optional[str]) -> int:
-    utc_dt = local_to_utc(dt_local, tz_str)
-    utc_iso = utc_dt.isoformat()
-    created = now_utc().isoformat()
-    count = 0
-    with db() as conn:
-        for cid in chat_ids:
-            conn.execute(
-                "INSERT INTO reminders (chat_id, text, send_at_utc, created_at_utc) VALUES (?, ?, ?, ?)",
-                (int(cid), text, utc_iso, created)
-            )
-            count += 1
-    return count
+# ----------- Telegram webhook (минимум) -----------
+@app.post("/telegram-webhook")
+def telegram_webhook():
+    # Обработаем только /start для ответа "я работаю"
+    try:
+        update = request.get_json(silent=True) or {}
+        msg = (update.get("message") or update.get("edited_message")) or {}
+        text = (msg.get("text") or "").strip().lower()
+        chat = msg.get("chat") or {}
+        cid = chat.get("id")
 
-# -------------------- Flask маршруты --------------------
+        if text.startswith("/start") and cid:
+            send_message(cid, "Привет! Я работаю. Жду напоминаний 😉")
+    except Exception:
+        pass
+    return jsonify(ok=True)
+
+# ----------- Служебные маршруты -----------
 @app.get("/")
 def root():
-    return "OK", 200
+    return "OK — Reminder bot is running"
 
-@app.post("/webhook")
-def webhook():
-    update = request.get_json(force=True, silent=True) or {}
-    msg = update.get("message") or {}
-    chat_id = msg.get("chat", {}).get("id")
-    text = (msg.get("text") or "").strip()
+@app.get("/health")
+def health():
+    return jsonify(ok=True, time=_iso(_now_local()))
 
-    # Простой /start
-    if text == "/start":
-        tg_send_message(chat_id, "Привет! Я работаю. Формат для добавления: \n/add 2025-08-14 10:00 Напомни позвонить")
-        return jsonify(ok=True)
+# ----------- API для добавления/удаления/списка -----------
+def _auth_ok(req):
+    return req.headers.get("Authorization") == API_SECRET
 
-    # Команда /add YYYY-MM-DD HH:MM Текст (локальное время, пояс по умолчанию DEFAULT_TZ)
-    if text.startswith("/add "):
-        try:
-            _, rest = text.split(" ", 1)
-            dt_part = rest[:16]  # 'YYYY-MM-DD HH:MM'
-            user_text = rest[17:].strip()
-            if not user_text:
-                raise ValueError("пустой текст")
-            add_many_reminders([chat_id], user_text, dt_part, DEFAULT_TZ)
-            tg_send_message(chat_id, f"✅ Напоминание поставлено на {dt_part} ({DEFAULT_TZ})")
-        except Exception as e:
-            tg_send_message(chat_id, f"❌ Ошибка формата. Пример: /add 2025-08-14 10:00 Позвонить. Детали: {e}")
-        return jsonify(ok=True)
+@app.post("/add_reminder")
+def add_reminder():
+    if not _auth_ok(request):
+        return jsonify(error="unauthorized"), 401
 
-    # Справка
-    if text in ("/help", "help", "?"):
-        tg_send_message(chat_id, "Команды:\n/start\n/add YYYY-MM-DD HH:MM Текст (время по твоему поясу)")
-        return jsonify(ok=True)
-
-    # Молчим на остальное
-    return jsonify(ok=True)
-
-# ----------- Внешний API для добавления напоминаний (для меня) -----------
-@app.post("/api/add_reminder")
-def api_add():
-    require_secret(request)
     data = request.get_json(force=True)
-    # Пример JSON:
-    # { "chat_ids": [123, 456], "text": "Тест из API", "when": "2025-08-14 09:30", "tz": "+05:00" }
-    chat_ids = data.get("chat_ids")
-    text = data.get("text")
-    when = data.get("when")
-    tz = data.get("tz") or DEFAULT_TZ
+    text = str(data.get("text", "")).strip()
+    when = str(data.get("time", "")).strip()  # "YYYY-MM-DD HH:MM" локальное
+    chat_ids = data.get("chat_ids")  # опционально: [int, int]
 
-    if not chat_ids or not text or not when:
-        abort(400, "chat_ids, text, when обязательны")
+    if not text or not when:
+        return jsonify(error="fields 'text' and 'time' are required"), 400
 
-    count = add_many_reminders(chat_ids, text, when, tz)
-    return jsonify(ok=True, inserted=count)
+    try:
+        dt = _parse_local_dt(when)
+    except Exception:
+        return jsonify(error="time must be 'YYYY-MM-DD HH:MM' in local timezone"), 400
 
-@app.get("/api/list")
-def api_list():
-    require_secret(request)
-    with db() as conn:
-        rows = conn.execute("SELECT id, chat_id, text, send_at_utc, attempts FROM reminders ORDER BY send_at_utc").fetchall()
-    return jsonify([dict(r) for r in rows])
+    item = {
+        "id": uuid.uuid4().hex,
+        "text": text,
+        "run_at": _iso(dt),
+        "sent": False,
+        "chat_ids": chat_ids if isinstance(chat_ids, list) else CHAT_IDS,
+        "created_by": "api"
+    }
+    items = _load_all()
+    items.append(item)
+    _save_all(items)
+    return jsonify(ok=True, reminder=item)
 
-@app.post("/api/delete")
-def api_delete():
-    require_secret(request)
-    rid = (request.get_json(force=True) or {}).get("id")
+@app.get("/list_reminders")
+def list_reminders():
+    if not _auth_ok(request):
+        return jsonify(error="unauthorized"), 401
+    return jsonify(items=_load_all())
+
+@app.post("/delete_reminder")
+def delete_reminder():
+    if not _auth_ok(request):
+        return jsonify(error="unauthorized"), 401
+    data = request.get_json(force=True)
+    rid = str(data.get("id", "")).strip()
     if not rid:
-        abort(400, "id обязателен")
-    with db() as conn:
-        conn.execute("DELETE FROM reminders WHERE id = ?", (rid,))
+        return jsonify(error="field 'id' is required"), 400
+
+    items = _load_all()
+    new_items = [x for x in items if x["id"] != rid]
+    _save_all(new_items)
+    return jsonify(ok=True, deleted=(len(items) - len(new_items)))
+
+@app.post("/test_notify")
+def test_notify():
+    if not _auth_ok(request):
+        return jsonify(error="unauthorized"), 401
+    broadcast("✅ Тестовое сообщение: бот на связи.")
     return jsonify(ok=True)
 
-# -------------------- Старт --------------------
-init_db()
-set_webhook()
+# ----------- Автозапуск: ставим webhook и поднимаем планировщик -----------
+def ensure_webhook():
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        target = f"{WEBHOOK_BASE}/telegram-webhook"
+        resp = requests.post(url, json={"url": target}, timeout=10).json()
+        print("📡 Результат установки вебхука:", resp, flush=True)
+    except Exception as e:
+        print("⚠️ setWebhook error:", e, flush=True)
 
-# Запуск планировщика в фоне
-threading.Thread(target=scheduler_loop, daemon=True).start()
+def start_background_worker():
+    th = threading.Thread(target=scheduler_loop, daemon=True)
+    th.start()
+
+# Важно: делаем это на импорт (для gunicorn)
+ensure_webhook()
+start_background_worker()
 
 # Экспорт для gunicorn
-app = app
+app.wsgi_app  # noqa: keep app imported as module attribute
+if __name__ == "__main__":
+    # Локальный запуск (не используется на Render)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
