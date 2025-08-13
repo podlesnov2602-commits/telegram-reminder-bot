@@ -1,3 +1,3 @@
 python-telegram-bot==20.3
-flask[async]
-gunicorn
+flask[async]==3.1.1
+gunicorn==23.0.0
