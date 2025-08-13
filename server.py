@@ -1,52 +1,53 @@
 import os
-from flask import Flask, request
 import requests
+from flask import Flask, request
+
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com
+
+if not TOKEN:
+    raise ValueError("❌ Переменная окружения TELEGRAM_TOKEN не установлена!")
+if not WEBHOOK_URL:
+    raise ValueError("❌ Переменная окружения WEBHOOK_URL не установлена!")
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена!")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-if not WEBHOOK_URL:
-    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    if hostname:
-        WEBHOOK_URL = f"https://{hostname}/webhook"
-    else:
-        raise ValueError("❌ WEBHOOK_URL не задан и Render не передал домен!")
-
-
+# Устанавливаем вебхук при старте
 def set_webhook():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    r = requests.get(url, params={"url": WEBHOOK_URL})
-    print("📡 Результат установки вебхука:", r.json())
+    url = f"{WEBHOOK_URL}/webhook"
+    response = requests.get(f"{TELEGRAM_API_URL}/setWebhook", params={"url": url})
+    print("📡 Результат установки вебхука:", response.json())
 
+set_webhook()
 
-# Устанавливаем вебхук при старте сервера
-with app.app_context():
-    set_webhook()
-
-
-@app.route("/")
-def home():
-    return "✅ Бот работает!"
-
-
+# Обработка сообщений от Telegram
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    update = request.json
-    if update and "message" in update:
-        chat_id = update["message"]["chat"]["id"]
-        text = update["message"].get("text", "")
+    data = request.get_json()
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "")
 
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": f"Вы написали: {text}"
-        })
+        if text.lower() == "/start":
+            send_message(chat_id, "Привет! Я работаю 🚀")
+        else:
+            send_message(chat_id, f"Ты написал: {text}")
 
-    return {"ok": True}
+    return "OK", 200
 
+# Тестовая главная страница
+@app.route("/", methods=["GET"])
+def home():
+    return "🤖 Telegram бот работает!", 200
+
+# Функция отправки сообщений
+def send_message(chat_id, text):
+    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text
+    })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
